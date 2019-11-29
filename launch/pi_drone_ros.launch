@@ -1,0 +1,4 @@
+<launch>
+  <node name="pi_drone" pkg="pi_drone_ros" type="pi_drone_driver.py" output="screen" />
+  <!--include file="$(find nano_drone)/launch/ps4_control.launch" /-->
+</launch>
