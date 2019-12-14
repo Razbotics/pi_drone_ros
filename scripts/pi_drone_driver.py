@@ -69,7 +69,7 @@ class pi_drone_driver():
 
             self.imu_msg.linear_acceleration.x = 9.81 * ax/512
             self.imu_msg.linear_acceleration.y = 9.81 * ay/512
-            self.imu_msg.linear_acceleration.z = 9.81 * az/512
+            self.imu_msg.linear_acceleration.z = -9.81 * az/512
 
             self.imu_msg.angular_velocity.x = self.deg2rad(gx/4.096)
             self.imu_msg.angular_velocity.y = self.deg2rad(gy/4.096)
