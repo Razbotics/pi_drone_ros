@@ -7,12 +7,33 @@ import traceback
 from geometry_msgs.msg import Vector3
 from raspicam_node.msg import MotionVectors
 
+class lowPassFilter():
+	def __init__(self, tap_coefs):
+		self.tap_coefs = tap_coefs
+		self.len_coefs = len(tap_coefs)
+		self.sample_buffer = [0]*self.len_coefs
+		self.buffer_index = 0
+
+	def filter(self, data):
+		self.result = 0
+		self.sample_buffer[self.buffer_index] = data
+		self.buffer_index += 1
+		if self.buffer_index >= self.len_coefs:
+			self.buffer_index=0
+
+		self.index = self.buffer_index
+		for i in range(self.len_coefs):
+			self.index = self.index - 1
+			if self.index < 0:
+				self.index = self.len_coefs - 1
+			self.result += self.tap_coefs[i]*self.sample_buffer[self.index]
+		return self.result
+
+
 class piOpticalFlow():
 	def __init__(self):
 		rospy.init_node("pi_optical_flow", anonymous=True)
-		self.tap_coefs = [0.11554707639860304,0.29982701496719005,0.07038867308845864,\
-		             0.2136045403910259,0.07038867308845864,0.29982701496719005,0.11554707639860304]
-		self.TAP_NUMBER = len(self.tap_coefs)
+		self.scalar = 10.0
 		rospy.Subscriber("/pi_drone/rpy", Vector3, self.rpy_callback)
 		rospy.Subscriber("/raspicam_node/motion_vectors", MotionVectors, self.motion_vectors_callback)
 		self.of_pub = rospy.Publisher("/pi_drone/optical_flow", Vector3, queue_size = 1)
@@ -22,15 +43,18 @@ class piOpticalFlow():
 		self.yaw = 0
 		self.prev_roll = 0
 		self.prev_pitch = 0
-		self.buffer_index = 0
-		self.motion_vectors_x_len = 0
-		self.motion_vectors_y_len = 0
 		self.motion_vectors_x = [0]
 		self.motion_vectors_y = [0]
-		self.sample_buffer_x = [0]*self.TAP_NUMBER
-		self.sample_buffer_y = [0]*self.TAP_NUMBER
 		self.prev_flow_process_time = 0
 		self.altitude = 1 #need real time altitude from sensor just a place holder for now
+		#self.tap_coefs = [0.1,0.25,0.05,0.2,0.05,0.25,0.1]
+		self.tap_coefs = [0.2] * 5 #these coefs are for average filter
+		self.low_pass_filter_x = lowPassFilter(self.tap_coefs)
+		self.low_pass_filter_y = lowPassFilter(self.tap_coefs)
+		self.low_pass_filter_roll = lowPassFilter(self.tap_coefs)
+		self.low_pass_filter_pitch = lowPassFilter(self.tap_coefs)
+		self.low_pass_filter_corrected_x = lowPassFilter(self.tap_coefs)
+		self.low_pass_filter_corrected_y = lowPassFilter(self.tap_coefs)
 
 		while not rospy.is_shutdown():
 			self.process_flow(20.0)
@@ -46,63 +70,54 @@ class piOpticalFlow():
 
 
 	def motion_vectors_callback(self, vector_msg):
-		self.motion_vectors_x_len = vector_msg.mbx
-		self.motion_vectors_y_len = vector_msg.mby
 		self.motion_vectors_x = vector_msg.x
 		self.motion_vectors_y = vector_msg.y
-
-
-	def get_filtered_value(self):
-		result_x = 0
-		result_y = 0
-		index = self.buffer_index
-
-		for i in range(self.TAP_NUMBER):
-			index = index - 1
-			if index < 0:
-				index = self.TAP_NUMBER - 1
-
-			result_x += self.tap_coefs[i]*self.sample_buffer_x[index]
-			result_y += self.tap_coefs[i]*self.sample_buffer_y[index]
-
-		return [result_x, result_y]
 
 
 	def process_flow(self, rate):
 	    if ((time.time() - self.prev_flow_process_time) >= (1.0 / rate)):
 			self.prev_flow_process_time = time.time()
 
-			x_shift = -np.average(self.motion_vectors_y)
-			y_shift = -np.average(self.motion_vectors_x)
+			x_vectors = np.array(self.motion_vectors_x)
+			y_vectors = np.array(self.motion_vectors_y)
+			x_vectors = x_vectors[np.nonzero(x_vectors)]
+			y_vectors = y_vectors[np.nonzero(y_vectors)]
+			if len(x_vectors) == 0:
+				x_vectors = np.append(x_vectors,[0])
+			if len(y_vectors) == 0:
+				y_vectors = np.append(y_vectors,[0])
+			x_shift = -np.average(y_vectors) #optical flow is relative to quadrotor
+			y_shift = -np.average(x_vectors) # x forward    y left
 
-			delta_rotation_roll = self.roll - self.prev_roll
-			delta_rotation_pitch = self.pitch - self.prev_pitch
-
+			delta_rotation_roll = (self.roll - self.prev_roll) * rate
+			delta_rotation_pitch = (self.pitch - self.prev_pitch) * rate
 			self.prev_roll = self.roll
 			self.prev_pitch = self.pitch
-			#print(int(100*delta_rotation_pitch), int(100*delta_rotation_roll))
-			x_shift = (x_shift/127)*16*rate * 1.12e-6  #pixels/sec * 1.12e-6 = m/sec
-			y_shift = (y_shift/127)*16*rate * 1.12e-6 #pixel size 1.12 micrometer = 1.12e-6 m
 
-			x_shift = math.atan2(x_shift, 3.04e-3) #focal length 3.04e-3 atan2(x_shift/focal_length) = rad/sec
-            y_shift = math.atan2(y_shift, 3.04e-3)
-			print(x_shift, y_shift)
+			x_shift = rate * self.scalar * (x_shift/2714)  # v/f, f = 2714 pixels according to specs
+			y_shift = rate * self.scalar * (y_shift/2714)  # scalar still needs to be determined
+			#print(x_shift, y_shift)
+
+			motion_x = self.low_pass_filter_x.filter(x_shift)
+			motion_y = self.low_pass_filter_y.filter(y_shift)
+			delta_rotation_roll = self.low_pass_filter_roll.filter(delta_rotation_roll)
+			delta_rotation_pitch = self.low_pass_filter_pitch.filter(delta_rotation_pitch)
+			#print(delta_rotation_roll)
+
 			# remove rotation movement
-			x_shift_corrected = x_shift + delta_rotation_pitch*rate #x_shift - rad/sec
-			y_shift_corrected = y_shift - delta_rotation_roll*rate  #y_shift - rad/sec
-            x_shift_corrected *= self.altitude #rad/sec * altitude = m/s
-			x_shift_corrected *= self.altitude #rad/sec * altitude = m/s
+			motion_corrected_x = motion_x + delta_rotation_pitch #recover translational components
+			motion_corrected_y = motion_y - delta_rotation_roll
 
-			self.sample_buffer_x[self.buffer_index] = x_shift_corrected
-			self.sample_buffer_y[self.buffer_index] = y_shift_corrected
-			self.buffer_index += 1
-			if self.buffer_index >= self.TAP_NUMBER:
-				self.buffer_index=0
+			#applying filter again
+			motion_corrected_x = self.low_pass_filter_corrected_x.filter(motion_corrected_x)
+			motion_corrected_y = self.low_pass_filter_corrected_y.filter(motion_corrected_y)
+			velocity_x = motion_corrected_x * self.altitude
+			velocity_y = motion_corrected_y * self.altitude
 
-			data_motion = self.get_filtered_value()
+			self.optical_flow_msg.x = velocity_x #delta_rotation_roll
+			self.optical_flow_msg.y = velocity_y
+			self.optical_flow_msg.z = motion_y
 
-			self.optical_flow_msg.x = data_motion[0]
-			self.optical_flow_msg.y = data_motion[1]
 			self.of_pub.publish(self.optical_flow_msg)
 			#print(data_motion[0], data_motion[1])
 
